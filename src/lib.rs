@@ -1,81 +1,105 @@
+use std::io::Read;
 use std::net::SocketAddr;
 use std::net::TcpStream;
+use std::str;
 use std::io::{ BufRead, BufReader };
-use std::convert::From;
 
 pub mod resp;
 
 use resp::*;
 
-struct RedisClient {
-    connection: TcpStream,
-    host: SocketAddr,
-    commands_handled: u32
+pub struct RedisClient {
+    pub connection: TcpStream,
+    pub commands_handled: u32
 }
 
-enum ClientError {
-    IO(std::io::Error),
-    UnknownError
-}
-
-impl From<std::io::Error> for ClientError {
-    fn from(io: std::io::Error) -> ClientError {
-        ClientError::IO(io)
+fn head_equals(v: &[u8], b: u8) -> bool {
+    match v.get(0) {
+        Some(&head) if head == b => true,
+        _ => false,
     }
 }
 
-type ClientResult<T> = Result<T, ClientError>;
-
-enum RedisData {
-    /// Redis 'SimpleString's to Rust's String type.
-    /// These cannot contain CRLFs
-    SimpleString(String),
-    /// Like 'SimpleString', but signifies an error case
-    Error(String),
-    /// FIXME: Not sure about the size of this
-    RedisInteger(i128), 
-    /// Arbitrary binary data with a known length
-    BulkString(Vec<u8>),
-    /// An array of any of the above types
-    Array(Vec<RedisData>)
-}
-
-/// Takes in a slice and returns owned data.
-/// Will probably need to do some copying
-fn parse_redis_data(buf: &[u8]) -> RedisData {
-    RedisData()
-}
-
-fn await_response(stream: &mut TcpStream) -> std::io::Result<String> {
+/// The BulkString type deals with pure binary data (Non UTF-8)
+fn await_response_bulkstr(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut buf_reader = BufReader::new(stream);
-    // let mut buf: [u8; 128] = [0u8; 128];
-    let mut response: Vec<u8> = Vec::new();
-    buf_reader.read_line(&mut response)?;
-    Ok(response)
+    let mut len_buf: Vec<u8> = Vec::new();
+    buf_reader.read_until(CR, &mut len_buf)?;
+    if len_buf.is_empty() {
+        return Err(Error::BadBulkString);
+    }
+    let (prefix, size_bytes) = len_buf.split_at(1);
+
+    if !head_equals(prefix, RespPrefix::BulkString.byte_repr()) {
+        return Err(Error::BadBulkString);
+    }
+    let head = prefix.get(0).map_or(Err(Error::BadBulkString), |h| Ok(h))?;
+    if *head != RespPrefix::BulkString.byte_repr() {
+        return Err(Error::BadBulkString);
+    }
+    let as_str = str::from_utf8(size_bytes).map_err(|_| Error::BadBulkString)?;
+    let size: usize = as_str.parse().map_err(|_| Error::BadBulkString)?;
+    let mut content_buf: Vec<u8> = Vec::with_capacity(size);
+    buf_reader.read_exact(&mut content_buf)?;
+    // len_buf.iter().
+    // let len = u64::from len_buf[1..];
+    Ok(content_buf)
+}
+
+/// The SimpleString type deals with data that we can assume is valid UTF-8
+fn await_response_simplestr(stream: &mut TcpStream) -> Result<String> {
+    let mut content_buf = String::new();
+    let mut buf_reader = BufReader::new(stream);
+    buf_reader.read_line(&mut content_buf)?;
+    let (prefix, content) = content_buf.split_at(1);
+    let head = prefix.chars().next().map_or(Err(Error::BadSimpleString), |h| Ok(h))?;
+    if head != RespPrefix::SimpleString.char_repr() {
+        return Err(Error::BadSimpleString);
+    }
+    Ok(content.to_string())
+}
+/// This type is just a CRLF terminated string representing an integer, prefixed by a ":" byte.
+/// For example ":0\r\n", or ":1000\r\n" are integer replies.
+/// Many Redis commands return RESP Integers, like INCR, LLEN and LASTSAVE.
+/// There is no special meaning for the returned integer, it is just an incremental number for INCR,
+/// a UNIX time for LASTSAVE and so forth. However, the returned integer is guaranteed to be in
+/// the range of a signed 64 bit integer.
+fn await_response_integer(stream: &mut TcpStream) -> Result<i64> {
+    let mut _content_buf: Vec<u8> = Vec::new();
+    let mut _buf_reader = BufReader::new(stream);
+    Err(Error::UnknownError)
 }
 
 impl RedisClient {
-    fn ping(&mut self) -> ClientResult<()> {
+    pub fn ping(&mut self) -> Result<()> {
         self.commands_handled = self.commands_handled + 1;
         send(&mut self.connection, Command::Ping)?;
-        let response = await_response(&mut self.connection)?;
-
-
+        let response = await_response_simplestr(&mut self.connection)?;
+        println!("Response from PING: {}", response);
+        // FIXME: Trim is required
+        if response.trim() == "PONG" {
+            Ok(())
+        } else {
+            Err(Error::UnknownError)
+        }
     }
-    fn set(&mut self, key: &str, value: &str) -> ClientResult<()> {
+    pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         self.commands_handled = self.commands_handled + 1;
-        match send(&mut self.connection, Command::Set(key.to_string(), value.to_string())) {
-            Ok(_) => Ok(()),
-            Err(ioerr) => Err(ClientError::IO(ioerr)),
+        send(&mut self.connection, Command::Set(key.to_string(), value.to_string()))?; 
+        let response = await_response_simplestr(&mut self.connection)?;
+        // FIXME: Trim is required
+        if response.trim() == "OK" {
+            Ok(())
+        } else {
+            Err(Error::UnknownError)
         }
     }
     /// Returns a rust string, not sure if this is strictly correct, we should
     /// probably not require valid UTF-8
-    fn get(&mut self, key: &str) -> ClientResult<String> {
+    pub fn get(&mut self, key: &str) -> Result<RedisData> {
         self.commands_handled = self.commands_handled + 1;
-        match send(&mut self.connection, Command::Get(key.to_string())) {
-            Ok(_) => ()
-        }
-        
+        send(&mut self.connection, Command::Get(key.to_string()))?;        
+        let response = await_response_bulkstr(&mut self.connection)?;
+        Ok(RedisData::BulkString(response))
     }
 }

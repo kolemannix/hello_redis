@@ -4,9 +4,9 @@ use std::str;
 
 /// Implementation of the REdiS Protocol (RESP)
 
-const CR: u8 = 0x0d;
-const LF: u8 = 0x0a;
-const CRLF: [u8; 2] = [0x0d, 0x0a];
+pub const CR: u8 = 0x0d;
+pub const LF: u8 = 0x0a;
+pub const CRLF: [u8; 2] = [0x0d, 0x0a];
 
 pub enum Command {
     Ping,
@@ -15,6 +15,24 @@ pub enum Command {
 }
 
 use Command::{Ping, Set, Get};
+
+#[derive(Debug)]
+pub enum Error {
+    IOError(std::io::Error),
+    InvalidPrefix,
+    BadBulkString,
+    BadSimpleString,
+    UnknownError
+}
+
+impl From<std::io::Error> for Error {
+    fn from(io: std::io::Error) -> Error { Error::IOError(io) }
+}
+impl From<()> for Error {
+    fn from(_: ()) -> Error { Error::UnknownError }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 // #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -29,35 +47,38 @@ pub enum RespPrefix {
 use RespPrefix::*;
 
 impl RespPrefix {
-    fn byte_repr(&self) -> u8 {
-        let c = match self {
+    pub fn byte_repr(&self) -> u8 {
+        let c = self.char_repr();
+        c as u8
+    }
+    pub fn char_repr(&self) -> char {
+        match self {
             SimpleString => '+',
             Error => '-',
             Integer => ':',
             BulkString => '$', 
             Array => '*',
-        };
-        c as u8
+        }
     }
 }
 
 impl TryFrom<char> for RespPrefix {
-    type Error = ();
-    fn try_from(c: char) -> Result<Self, ()> {
+    type Error = Error;
+    fn try_from(c: char) -> Result<Self> {
         RespPrefix::try_from(c as u8)
     }
 }
 
 impl TryFrom<u8> for RespPrefix {
-    type Error = ();
-    fn try_from(byte: u8) -> Result<Self, ()> {
+    type Error = Error;
+    fn try_from(byte: u8) -> Result<Self> {
         match byte {
             b'+' => Ok(RespPrefix::SimpleString),
             b'-' => Ok(RespPrefix::Error),
             b':' => Ok(RespPrefix::Integer),
             b'$' => Ok(RespPrefix::BulkString),
             b'*' => Ok(RespPrefix::Array),
-            _ => Err(())
+            _ => Err(Error::InvalidPrefix)
         }
     }
 }
@@ -119,3 +140,34 @@ mod tests {
     }
     
 }
+
+
+// Receiving
+
+
+pub enum RedisData {
+    /// Redis 'SimpleString's to Rust's String type.
+    /// These cannot contain CRLFs
+    SimpleString(String),
+    /// Like 'SimpleString', but signifies an error case
+    Error(String),
+    /// FIXME: Not sure about the size of this
+    RedisInteger(i128), 
+    /// Arbitrary binary data with a known length
+    BulkString(Vec<u8>),
+    /// An array of any of the above types
+    Array(Vec<RedisData>)
+}
+
+// Takes in a slice and returns owned data.
+// Will probably need to do some copying
+// fn parse_redis_data(buf: &[u8]) -> Result<RedisData> {
+//     let prefix = RespPrefix::try_from(buf[0])?;
+//     match prefix {
+//         RespPrefix::SimpleString => {
+//             let ss = buf.iter().take_while(|x| x != CR);
+//         }
+//     }
+
+//     Err(Error::UnknownError)
+// }
